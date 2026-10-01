@@ -15,6 +15,10 @@ make compress-native SRC=~/Pictures/DCIM DEST=~/Pictures/DCIM-compressed
 make check           SRC=~/Pictures/DCIM DEST=~/Pictures/DCIM-compressed
 ```
 
+![Progression de la compression, vidéo par vidéo](docs/screenshots/progress.png)
+
+![Récapitulatif en fin d'exécution](docs/screenshots/summary.png)
+
 | Cible             | Rôle                                                              |
 |-------------------|-------------------------------------------------------------------|
 | `compress-native` | Compresse avec le FFmpeg de la machine (≈ 2× plus rapide sur Mac) |
