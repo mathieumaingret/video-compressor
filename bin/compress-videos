@@ -14,6 +14,7 @@ readonly LOG_HOST=${LOG_HOST:-$LOG_ROOT}
 readonly CODEC=${CODEC:-libx265}
 readonly PRESET=${PRESET:-medium}
 readonly MOVFLAGS=${MOVFLAGS:-use_metadata_tags+faststart}
+readonly RECURSIVE=${RECURSIVE:-false}
 
 case $CODEC in
   libx264) CRF=${CRF:-23} ;;
@@ -159,6 +160,7 @@ encode() {
   die "the source folder must not be the destination folder or inside it."
 
 find_args=("$SRC_ROOT")
+[[ $RECURSIVE == true ]] || find_args+=(-maxdepth 1)
 if [[ $DEST_HOST == "$SRC_HOST"/* ]]; then
   find_args+=(-path "$SRC_ROOT/${DEST_HOST#"$SRC_HOST"/}" -prune -o)
 fi
@@ -185,6 +187,7 @@ total_src_size=0 total_dest_size=0
 ui_title 'Video compressor'
 ui_field Source "$SRC_HOST"
 ui_field Destination "$DEST_HOST"
+ui_field Recursive "$RECURSIVE"
 ui_field Encoder "$CODEC · CRF $CRF · preset $PRESET"
 ui_field Videos "$total found · $count to compress · $skipped already done"
 

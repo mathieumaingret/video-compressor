@@ -24,6 +24,7 @@ services:
       CRF: ${CRF:-}
       PRESET: ${PRESET:-medium}
       MOVFLAGS: ${MOVFLAGS:-use_metadata_tags+faststart}
+      RECURSIVE: ${RECURSIVE:-false}
       NO_COLOR: ${NO_COLOR:-}
     volumes:
       - type: bind

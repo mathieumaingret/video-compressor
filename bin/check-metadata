@@ -7,6 +7,7 @@ set -Eeuo pipefail
 source "$(dirname "$0")/ui.sh"
 
 readonly SRC_ROOT=/src DEST_ROOT=/dist
+readonly RECURSIVE=${RECURSIVE:-false}
 # Re-encoding legitimately rewrites these codec-level tags.
 readonly IGNORED_TAGS='\.(encoder|vendor_id)='
 
@@ -69,7 +70,9 @@ print_diff() {
   done <<<"$1"
 }
 
-mapfile -d '' videos < <(find "$DEST_ROOT" -type f -iname '*.mp4' ! -name '.*' -print0)
+find_depth=()
+[[ $RECURSIVE == true ]] || find_depth=(-maxdepth 1)
+mapfile -d '' videos < <(find "$DEST_ROOT" ${find_depth[@]+"${find_depth[@]}"} -type f -iname '*.mp4' ! -name '.*' -print0)
 identical=0 different=0 orphans=0
 
 ui_title 'Metadata check'
