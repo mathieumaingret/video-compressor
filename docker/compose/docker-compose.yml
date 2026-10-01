@@ -1,0 +1,38 @@
+name: ${COMPOSE_PROJECT_NAME:-video-compressor}
+
+services:
+  compressor:
+    build:
+      context: .
+      dockerfile: docker/compressor/Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-video-compressor}-compressor
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    init: true
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      SRC_HOST: ${SRC_DIR:-}
+      DEST_HOST: ${DEST_DIR:-}
+      LOG_HOST: ${LOG_DIR:-}
+      CODEC: ${CODEC:-libx265}
+      CRF: ${CRF:-}
+      PRESET: ${PRESET:-medium}
+      MOVFLAGS: ${MOVFLAGS:-use_metadata_tags+faststart}
+      NO_COLOR: ${NO_COLOR:-}
+    volumes:
+      - type: bind
+        source: ${SRC_DIR:-./source}
+        target: /src
+        read_only: true
+      - type: bind
+        source: ${DEST_DIR:-./dist}
+        target: /dist
+      - type: bind
+        source: ${LOG_DIR:-./logs}
+        target: /logs

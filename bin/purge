@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Deletes the content of the project's own source/, dist/ and logs/ folders; the folders stay.
+# Never follows SRC/DEST/LOGS: nothing outside the project can be purged.
+# Asks for confirmation unless CONFIRM=yes. Runs on the host: bash 3.2 compatible.
+set -Eeuo pipefail
+
+# shellcheck source=ui.sh
+source "$(dirname "$0")/ui.sh"
+
+project_dir=$(cd "$(dirname "$0")/.." && pwd -P)
+dirs=()
+total_files=0
+
+ui_title 'Purge'
+
+for name in source dist logs; do
+  dir="$project_dir/$name"
+  [[ -d $dir ]] || continue
+  # A symlinked folder (e.g. source -> DCIM) would lead outside the project.
+  if [[ -L $dir || $(cd "$dir" && pwd -P) != "$dir" ]]; then
+    ui_error "$name/ points outside the project, refusing to purge it."
+    exit 1
+  fi
+
+  files=$(find "$dir" -mindepth 1 -type f | wc -l | tr -d ' ')
+  ((files > 0)) || continue
+  total_files=$((total_files + files))
+  dirs+=("$dir")
+
+  size=$(du -sh "$dir" | cut -f1 | tr -d ' ')
+  plural=s
+  ((files == 1)) && plural=''
+  ui_field "$name/" "$files file$plural, $size"
+done
+
+if ((total_files == 0)); then
+  ui_ok 'Nothing to purge.'
+  echo
+  exit 0
+fi
+echo
+
+if [[ ${CONFIRM:-} != yes ]]; then
+  if [[ ! -t 0 ]]; then
+    ui_error 'confirmation required: run in a terminal or pass CONFIRM=yes.'
+    exit 1
+  fi
+  answer=''
+  read -r -p "  Type ${C_BOLD}yes${C_RESET} to delete these files: " answer || true
+  if [[ $answer != yes ]]; then
+    ui_fail 'Aborted, nothing deleted.'
+    echo
+    exit 1
+  fi
+fi
+
+for dir in "${dirs[@]}"; do
+  find "$dir" -mindepth 1 -delete
+done
+ui_ok 'Purged.'
+echo

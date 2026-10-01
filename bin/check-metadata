@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Compares the metadata and mtime of every video in /dist with its /src original.
+# Exits non-zero when at least one video differs.
+set -Eeuo pipefail
+
+# shellcheck source=ui.sh
+source "$(dirname "$0")/ui.sh"
+
+readonly SRC_ROOT=/src DEST_ROOT=/dist
+# Re-encoding legitimately rewrites these codec-level tags.
+readonly IGNORED_TAGS='\.(encoder|vendor_id)='
+
+# Sorted because the MP4 muxer writes tags in a different order than the source.
+probe() {
+  ffprobe -v error -of flat \
+    -show_entries 'format_tags:stream=index,codec_type,codec_tag_string:stream_tags:stream_side_data=rotation' "$1" |
+    grep -Ev "$IGNORED_TAGS" | normalize_streams | sort || true
+}
+
+# Renames "streams.stream.<index>" to "streams.<type>.<rank>" (video.0, audio.0, data.1…):
+# once an unsupported data track is dropped, the remaining tracks get new indexes.
+# The MP4 muxer rebuilds timecode tracks and names them after the video track's handler.
+# codec_tag_string is only read to spot them: it legitimately differs on the video track.
+normalize_streams() {
+  awk '
+    {
+      key[NR] = substr($0, 1, index($0, "=") - 1)
+      value[NR] = substr($0, index($0, "=") + 1)
+      split(key[NR], parts, ".")
+    }
+    key[NR] ~ /^streams\.stream\.[0-9]+\.codec_type$/ {
+      type[parts[3]] = value[NR]
+      if (parts[3] + 0 > last) last = parts[3] + 0
+    }
+    key[NR] ~ /^streams\.stream\.[0-9]+\.codec_tag_string$/ && value[NR] == "\"tmcd\"" {
+      timecode[parts[3]] = 1
+    }
+    END {
+      for (n = 0; n <= last; n++) {
+        if (!(n in type)) continue
+        t = type[n]
+        gsub(/"/, "", t)
+        label[n] = t "." (rank[t] + 0)
+        rank[t]++
+        print "streams." label[n] "=present"
+      }
+      for (i = 1; i <= NR; i++) {
+        k = key[i]
+        if (k !~ /^streams\.stream\./) { print k "=" value[i]; continue }
+        split(k, parts, ".")
+        if (k ~ /\.(index|codec_type|codec_tag_string)$/) continue
+        if ((parts[3] in timecode) && k ~ /\.tags\.handler_name$/) continue
+        sub(/^streams\.stream\.[0-9]+\./, "", k)
+        print "streams." label[parts[3]] "." k "=" value[i]
+      }
+    }'
+}
+
+# Removed lines in red, added lines in green; diff's own headers are dropped.
+print_diff() {
+  local line
+  while IFS= read -r line; do
+    case $line in
+      '---'* | '+++'* | '@@'*) ;;
+      '-'*) printf '      %s%s%s\n' "${C_RED}" "$line" "${C_RESET}" ;;
+      '+'*) printf '      %s%s%s\n' "${C_GREEN}" "$line" "${C_RESET}" ;;
+      *) printf '      %s%s%s\n' "${C_DIM}" "$line" "${C_RESET}" ;;
+    esac
+  done <<<"$1"
+}
+
+mapfile -d '' videos < <(find "$DEST_ROOT" -type f -iname '*.mp4' ! -name '.*' -print0)
+identical=0 different=0 orphans=0
+
+ui_title 'Metadata check'
+ui_field Videos "${#videos[@]} in the destination"
+
+for dest in ${videos[@]+"${videos[@]}"}; do
+  rel=${dest#"$DEST_ROOT"/}
+  src="$SRC_ROOT/$rel"
+
+  if [[ ! -f $src ]]; then
+    orphans=$((orphans + 1))
+    printf '  %s• %s (no source)%s\n' "${C_DIM}" "$rel" "${C_RESET}"
+    continue
+  fi
+
+  report=$(diff -U 1 <(probe "$src") <(probe "$dest") || true)
+  mtime_diff=0
+  [[ $(stat -c %Y -- "$src") != $(stat -c %Y -- "$dest") ]] && mtime_diff=1
+
+  if [[ -z ${report//$'\n'/} ]] && ((!mtime_diff)); then
+    identical=$((identical + 1))
+    printf '  %s✔%s %s\n' "${C_GREEN}" "${C_RESET}" "$rel"
+  else
+    different=$((different + 1))
+    printf '  %s✖%s %s\n' "${C_RED}" "${C_RESET}" "$rel"
+    [[ -n $report ]] && print_diff "$report"
+    ((mtime_diff)) && printf '      %smodification date differs%s\n' "${C_RED}" "${C_RESET}"
+  fi
+done
+
+ui_section Summary
+different_color=${C_DIM}
+((different)) && different_color=${C_RED}
+ui_field Result "${C_GREEN}✔ $identical identical${C_RESET} · ${different_color}✖ $different different${C_RESET} · $orphans without source"
+echo
+((different == 0))

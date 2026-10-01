@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# Compresses every MP4 of SRC_ROOT that is missing from DEST_ROOT, keeping metadata and mtime.
+# Writes one CSV line per processed video into LOG_ROOT.
+# Runs in the container and natively on macOS: stays compatible with bash 3.2 and BSD tools.
+set -Eeuo pipefail
+
+# shellcheck source=ui.sh
+source "$(dirname "$0")/ui.sh"
+
+# Container mount points by default; "make compress-native" passes the host folders.
+readonly SRC_ROOT=${SRC_ROOT:-/src} DEST_ROOT=${DEST_ROOT:-/dist} LOG_ROOT=${LOG_ROOT:-/logs}
+readonly SRC_HOST=${SRC_HOST:?SRC_HOST is required} DEST_HOST=${DEST_HOST:?DEST_HOST is required}
+readonly LOG_HOST=${LOG_HOST:-$LOG_ROOT}
+readonly CODEC=${CODEC:-libx265}
+readonly PRESET=${PRESET:-medium}
+readonly MOVFLAGS=${MOVFLAGS:-use_metadata_tags+faststart}
+
+case $CODEC in
+  libx264) CRF=${CRF:-23} ;;
+  *) CRF=${CRF:-28} ;;
+esac
+readonly CRF
+
+codec_opts=()
+case $CODEC in
+  # Without the hvc1 tag, Apple players refuse to open HEVC in MP4.
+  *265* | hevc*) codec_opts+=(-tag:v hvc1) ;;
+esac
+# x265 fails to size its thread pool from the container's NUMA topology and falls back to
+# ~2 cores; an explicit pool size restores full multithreading (about 4x faster).
+[[ $CODEC == libx265 ]] && codec_opts+=(-x265-params "log-level=error:pools=$(nproc 2>/dev/null || sysctl -n hw.ncpu)")
+
+# libnuma cannot read the CPU topology or set memory policies in a container: harmless.
+readonly NUMA_NOISE='^(libnuma: |numa_sched_setaffinity|set_mempolicy: |x265 \[error\]: Failed to genrate CPU mask)'
+
+log_file="$LOG_ROOT/compress-$(date -u +%Y%m%d-%H%M%S).csv"
+err_file=$(mktemp "${TMPDIR:-/tmp}/compress-videos.XXXXXX")
+current_tmp=''
+trap 'rm -f -- "$current_tmp" "$err_file"' EXIT
+trap 'ui_progress_clear; echo; ui_fail "Interrupted"; exit 130' INT
+trap 'exit 143' TERM
+
+die() {
+  ui_error "$*"
+  exit 1
+}
+
+# GNU/busybox stat in the container, BSD stat on macOS.
+if stat -c %s / >/dev/null 2>&1; then
+  file_size() { stat -c %s -- "$1"; }
+else
+  file_size() { stat -f %z -- "$1"; }
+fi
+
+csv_field() {
+  printf '"%s"' "${1//\"/\"\"}"
+}
+
+# Decimal megabytes like the Finder, with a decimal comma for French spreadsheets.
+size_mb() {
+  [[ -n $1 ]] || return 0
+  awk -v b="$1" 'BEGIN { printf "%.1f", b / 1000000 }' | tr . ,
+}
+
+log_entry() {
+  local status=$1 src=$2 src_size=$3 dest=$4 dest_size=$5 saved=$6 note=${7:-}
+  [[ -f $log_file ]] ||
+    echo 'date,status,source_path,source_size,source_size_mb,dest_path,dest_size,dest_size_mb,saved_percent,note' >"$log_file"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date -u +%FT%TZ)" "$status" \
+    "$(csv_field "$src")" "$src_size" "$(csv_field "$(size_mb "$src_size")")" \
+    "$(csv_field "$dest")" "$dest_size" "$(csv_field "$(size_mb "$dest_size")")" \
+    "$saved" "$(csv_field "$note")" >>"$log_file"
+}
+
+# Fills data_maps with the data tracks to copy and dropped_tracks with the others.
+# ffmpeg cannot read tracks of unknown codec (Pixel "mett", …), so the MP4 muxer cannot
+# write them back; timecode tracks are not reported, the muxer rebuilds them from the tag.
+probe_data_tracks() {
+  local index codec tag seen=' '
+  data_maps=() dropped_tracks=()
+  while IFS=, read -r index codec tag; do
+    # ffprobe >= 8 lists grouped streams a second time, after a blank line.
+    [[ -z $index || $seen == *" $index "* ]] && continue
+    seen+="$index "
+    if [[ $codec != unknown ]]; then
+      data_maps+=(-map "0:$index")
+    elif [[ $tag != tmcd ]]; then
+      dropped_tracks+=("$tag")
+    fi
+  done < <(ffprobe -v quiet -select_streams d -show_entries stream=index,codec_name,codec_tag_string -of csv=p=0 "$1" || true)
+}
+
+# Fills metadata_fix with the options restoring a single creation_time.
+# Recent ffmpeg (seen with 9.0, not 6.1) joins the duplicate creation_time tags written by
+# use_metadata_tags (mvhd + mdta keys) into "A;B", which its muxer cannot parse back:
+# every track would then lose its creation date.
+probe_creation_time() {
+  local value
+  metadata_fix=()
+  value=$(ffprobe -v quiet -show_entries format_tags=creation_time -of csv=p=0 "$1" || true)
+  [[ $value == *';'* ]] && metadata_fix=(-metadata "creation_time=${value%%;*}")
+  return 0
+}
+
+# Sets duration (microseconds, 0 when unknown) and resolution of the first video track.
+probe_video_info() {
+  local key value width='' height=''
+  duration=0 resolution='?'
+  while IFS='=' read -r key value; do
+    case $key in
+      duration) [[ $value =~ ^[0-9.]+$ ]] && duration=$(awk -v d="$value" 'BEGIN { printf "%d", d * 1000000 }') ;;
+      width) width=$value ;;
+      height) height=$value ;;
+    esac
+  done < <(ffprobe -v quiet -select_streams V:0 -show_entries format=duration:stream=width,height -of default=nw=1 "$1" || true)
+  [[ -n $width ]] && resolution="${width}×${height}"
+  return 0
+}
+
+# Turns ffmpeg's -progress blocks into a progress bar with elapsed time and ETA.
+show_progress() {
+  local duration=$1 started=$SECONDS key value percent=0 speed='' elapsed eta
+  while IFS='=' read -r key value; do
+    case $key in
+      out_time_us) [[ $value =~ ^[0-9]+$ ]] && ((duration > 0)) && percent=$((value * 100 / duration)) ;;
+      speed) speed=${value// /} ;;
+      progress)
+        ((percent > 100)) && percent=100
+        elapsed=$((SECONDS - started))
+        eta='…'
+        ((percent > 0)) && eta=$(ui_duration $((elapsed * (100 - percent) / percent)))
+        ui_progress "$percent" "$(ui_duration "$elapsed") · ETA $eta · $speed"
+        ;;
+    esac
+  done
+  ui_progress_clear
+}
+
+last_error() {
+  grep -Ev "$NUMA_NOISE" "$err_file" | tail -n 1 || true
+}
+
+# Extra arguments are output options (data track maps, metadata overrides).
+encode() {
+  local src=$1 out=$2 duration=$3
+  shift 3
+
+  # -noautorotate keeps the original display matrix instead of rotating pixels.
+  # stderr is kept aside: only the last error is shown if every attempt fails.
+  ffmpeg -hide_banner -nostdin -loglevel error -nostats -progress pipe:1 -y \
+    -noautorotate -i "$src" \
+    -map 0:V -map '0:a?' -map '0:s?' ${1+"$@"} -map_metadata 0 \
+    -c copy -c:v "$CODEC" -crf "$CRF" -preset "$PRESET" ${codec_opts[@]+"${codec_opts[@]}"} \
+    -movflags "$MOVFLAGS" -f mp4 "$out" \
+    2>"$err_file" | show_progress "$duration"
+}
+
+[[ $SRC_HOST == "$DEST_HOST" || $SRC_HOST == "$DEST_HOST"/* ]] &&
+  die "the source folder must not be the destination folder or inside it."
+
+find_args=("$SRC_ROOT")
+if [[ $DEST_HOST == "$SRC_HOST"/* ]]; then
+  find_args+=(-path "$SRC_ROOT/${DEST_HOST#"$SRC_HOST"/}" -prune -o)
+fi
+find_args+=(-type f -iname '*.mp4' ! -name '.*' -print0)
+videos=()
+while IFS= read -r -d '' video; do
+  videos+=("$video")
+done < <(find "${find_args[@]}")
+
+total=${#videos[@]}
+pending=()
+skipped=0
+for ((i = 0; i < total; i++)); do
+  if [[ -e "$DEST_ROOT/${videos[$i]#"$SRC_ROOT"/}" ]]; then
+    skipped=$((skipped + 1))
+  else
+    pending+=("${videos[$i]}")
+  fi
+done
+count=${#pending[@]}
+compressed=0 copied=0 failed=0
+total_src_size=0 total_dest_size=0
+
+ui_title 'Video compressor'
+ui_field Source "$SRC_HOST"
+ui_field Destination "$DEST_HOST"
+ui_field Encoder "$CODEC · CRF $CRF · preset $PRESET"
+ui_field Videos "$total found · $count to compress · $skipped already done"
+
+for ((i = 0; i < count; i++)); do
+  src=${pending[$i]}
+  rel=${src#"$SRC_ROOT"/}
+  dest="$DEST_ROOT/$rel"
+  started=$SECONDS
+
+  mkdir -p -- "$(dirname -- "$dest")"
+  current_tmp="$(dirname -- "$dest")/.$(basename -- "$dest").part"
+  src_size=$(file_size "$src")
+
+  probe_data_tracks "$src"
+  probe_creation_time "$src"
+  probe_video_info "$src"
+  note=''
+  ((${#dropped_tracks[@]})) && note="data tracks dropped: ${dropped_tracks[*]}"
+
+  ui_item "$((i + 1))/$count" "$rel"
+  details=$(ui_size "$src_size")
+  ((duration > 0)) && details+=" · $(ui_duration $((duration / 1000000))) · $resolution"
+  ui_detail "$details"
+
+  # ${a[@]+"${a[@]}"}: bash 3.2 treats an empty array as unbound under set -u.
+  if encode "$src" "$current_tmp" "$duration" ${metadata_fix[@]+"${metadata_fix[@]}"} ${data_maps[@]+"${data_maps[@]}"}; then
+    :
+  elif ((${#data_maps[@]})) && encode "$src" "$current_tmp" "$duration" ${metadata_fix[@]+"${metadata_fix[@]}"}; then
+    note='data tracks dropped (unsupported by the MP4 muxer)'
+  else
+    rm -f -- "$current_tmp"
+    current_tmp=''
+    failed=$((failed + 1))
+    log_entry failed "$SRC_HOST/$rel" "$src_size" '' '' ''
+    ui_fail "Failed: $(last_error)"
+    continue
+  fi
+
+  status=compressed
+  if (($(file_size "$current_tmp") >= src_size)); then
+    status=copied
+    note=''
+    cp -p -- "$src" "$current_tmp"
+  fi
+  touch -r "$src" -- "$current_tmp"
+  mv -f -- "$current_tmp" "$dest"
+  current_tmp=''
+
+  dest_size=$(file_size "$dest")
+  saved=$(awk -v s="$src_size" -v d="$dest_size" 'BEGIN { printf "%.1f", s ? (s - d) * 100 / s : 0 }')
+  log_entry "$status" "$SRC_HOST/$rel" "$src_size" "$DEST_HOST/$rel" "$dest_size" "$saved" "$note"
+  total_src_size=$((total_src_size + src_size))
+  total_dest_size=$((total_dest_size + dest_size))
+  if [[ $status == compressed ]]; then
+    compressed=$((compressed + 1))
+    ui_ok "$(ui_size "$src_size") → $(ui_size "$dest_size")  ${C_GREEN}−$saved %${C_RESET}  ${C_DIM}in $(ui_duration $((SECONDS - started)))${C_RESET}"
+  else
+    copied=$((copied + 1))
+    ui_warn "No gain: original copied as is ($(ui_size "$src_size"))"
+  fi
+  [[ -n $note ]] && ui_warn "$note"
+done
+
+ui_section Summary
+if ((count == 0)); then
+  ui_ok 'Nothing to do: every video is already in the destination.'
+else
+  failed_color=${C_DIM}
+  ((failed)) && failed_color=${C_RED}
+  ui_field Result "${C_GREEN}✔ $compressed compressed${C_RESET} · ${C_YELLOW}$copied copied${C_RESET} · $skipped already done · ${failed_color}✖ $failed failed${C_RESET}"
+  if ((compressed + copied)); then
+    total_saved=$(awk -v s="$total_src_size" -v d="$total_dest_size" 'BEGIN { printf "%.1f", s ? (s - d) * 100 / s : 0 }')
+    ui_field Size "$(ui_size "$total_src_size") → $(ui_size "$total_dest_size")  ${C_GREEN}−$total_saved %${C_RESET}"
+  fi
+  ui_field Time "$(ui_duration "$SECONDS")"
+fi
+[[ -f $log_file ]] && ui_field Log "$LOG_HOST/${log_file##*/}"
+echo
+((failed == 0))
